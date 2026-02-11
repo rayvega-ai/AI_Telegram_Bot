@@ -1,8 +1,12 @@
+# main.py — production-focused OrionX Assistant (compact & robust)
 import os
 import asyncio
 import json
 import logging
+import textwrap
 from typing import Optional, Iterable
+from tempfile import NamedTemporaryFile
+from time import time
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -11,39 +15,66 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 
 # ---------------------------
-# 1. Загрузка окружения
+# 0. Инструкция по .env
+# ---------------------------
+# TELEGRAM_TOKEN=...
+# GEMINI_API_KEY=...   # ключ из Google AI Studio (aistudio)
+# MY_ID=6055791149     # твой Telegram ID (опционально)
+# FALLBACK_MODEL=gemini-2.0-flash   # опция, если list_models недоступен
+
+# ---------------------------
+# 1. Загрузка окружения и проверки
 # ---------------------------
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 MY_ID = int(os.getenv("MY_ID", "6055791149"))
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL")  # опционально, например "gemini-2.0"
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL")  # опционально
 
-if not TELEGRAM_TOKEN or not GEMINI_KEY:
-    raise RuntimeError("TELEGRAM_TOKEN or GEMINI_API_KEY not set in .env")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN не задан в .env")
+if not GEMINI_KEY:
+    raise RuntimeError("GEMINI_API_KEY не задан в .env (создавай ключ в AI Studio)")
 
 # ---------------------------
 # 2. Логирование и бот
 # ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("orionx")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
 HISTORY_FILE = "memory.json"
 HISTORY_LIMIT = 10
+TELEGRAM_MESSAGE_LIMIT = 4000  # безопасный предел для одного сообщения
 
 # ---------------------------
-# 3. Gemini init + выбор модели
+# 3. Помощники для safe json write
+# ---------------------------
+def atomic_write_json(path: str, data):
+    dirpath = os.path.dirname(os.path.abspath(path)) or "."
+    with NamedTemporaryFile("w", delete=False, dir=dirpath, encoding="utf-8") as tf:
+        json.dump(data, tf, ensure_ascii=False, indent=2)
+        tmpname = tf.name
+    os.replace(tmpname, path)
+
+def load_json_safe(path: str):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.exception("Не удалось прочитать %s: %s", path, e)
+        return {}
+
+# ---------------------------
+# 4. Инициализация Gemini и выбор модели
 # ---------------------------
 genai.configure(api_key=GEMINI_KEY)
 
 def choose_available_model(models: Iterable, preferred_keywords=("gemini", "flash", "2.0", "3.0")) -> Optional[str]:
-    """
-    Выбирает первую подходящую модель из iterable models.
-    Ищем модель по ключевым словам и поддержке методов генерации.
-    """
     available = []
     for m in models:
         name = getattr(m, "name", None) or getattr(m, "model", None) or None
@@ -51,28 +82,25 @@ def choose_available_model(models: Iterable, preferred_keywords=("gemini", "flas
         available.append({"name": name, "methods": methods})
 
     logger.info("Найдено моделей: %d", len(available))
-
-    # Первичный выбор: имя содержит ключевое слово и поддерживает generateContent/chat
+    # первичный выбор
     for entry in available:
         name = entry["name"]
         methods = entry["methods"]
         if not name:
             continue
-        name_low = name.lower()
-        if any(k in name_low for k in preferred_keywords) and any(
+        nl = name.lower()
+        if any(k in nl for k in preferred_keywords) and any(
             m in methods for m in ("generateContent", "chat", "sendMessage", "send_message")
         ):
             logger.info("Выбрана модель: %s (методы: %s)", name, methods)
             return name
-
-    # Fallback: любая модель с generateContent
+    # fallback
     for entry in available:
         name = entry["name"]
         methods = entry["methods"]
         if name and "generateContent" in methods:
-            logger.info("Fallback выбор модели: %s", name)
+            logger.info("Fallback модель: %s", name)
             return name
-
     return None
 
 def detect_model() -> str:
@@ -86,15 +114,13 @@ def detect_model() -> str:
     if selected:
         return selected
 
-    # Если ничего не найдено — используем FALLBACK_MODEL или подсказываем в ошибке
     if FALLBACK_MODEL:
-        logger.warning("Автовыбор модели не удался — использую FALLBACK_MODEL из окружения: %s", FALLBACK_MODEL)
+        logger.warning("Автовыбор модели не удался — использую FALLBACK_MODEL: %s", FALLBACK_MODEL)
         return FALLBACK_MODEL
 
-    # Явная ошибка с инструкцией, чтобы пользователь не получил silent 404
     raise RuntimeError(
-        "Не удалось автоматически подобрать модель Gemini. "
-        "Установи переменную окружения FALLBACK_MODEL или проверь права API-ключа."
+        "Не удалось подобрать модель автоматически. "
+        "Укажи FALLBACK_MODEL в .env (например gemini-2.0-flash) или запусти сервер в поддерживаемом регионе."
     )
 
 SELECTED_MODEL = detect_model()
@@ -105,51 +131,83 @@ def get_model(is_admin: bool = False):
     system_instruction = f"Максим — твой создатель. {base_prompt}" if is_admin else f"{base_prompt} Ты создан Максимом."
     try:
         return genai.GenerativeModel(model_name=SELECTED_MODEL, system_instruction=system_instruction)
-    except Exception as e:
-        logger.exception("Ошибка создания GenerativeModel с system_instruction: %s", e)
-        # Пробуем без system_instruction
-        try:
-            return genai.GenerativeModel(model_name=SELECTED_MODEL)
-        except Exception as e2:
-            logger.exception("Повторная ошибка создания GenerativeModel: %s", e2)
-            raise
+    except Exception:
+        logger.exception("Ошибка создания GenerativeModel с system_instruction, пробую без system_instruction")
+        return genai.GenerativeModel(model_name=SELECTED_MODEL)
 
 # ---------------------------
-# 4. Работа с историей (json)
+# 5. Работа с историей
 # ---------------------------
 def load_history() -> dict:
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.exception("Не удалось загрузить историю: %s", e)
-            return {}
-    return {}
+    return load_json_safe(HISTORY_FILE)
 
-def save_history(data: dict):
+def save_history(h: dict):
     try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        atomic_write_json(HISTORY_FILE, h)
     except Exception as e:
-        logger.exception("Не удалось сохранить историю: %s", e)
+        logger.exception("Ошибка сохранения истории: %s", e)
 
 # ---------------------------
-# 5. Хендлеры
+# 6. Вспомогательные функции
+# ---------------------------
+async def send_long_message(dest: types.Chat | int, text: str):
+    # Разбиваем длинные ответы на куски <= TELEGRAM_MESSAGE_LIMIT
+    for chunk in textwrap.wrap(text, TELEGRAM_MESSAGE_LIMIT, replace_whitespace=False):
+        await bot.send_message(chat_id=dest, text=chunk)
+
+# ---------------------------
+# 7. Команды (минимальный набор)
 # ---------------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("Привет! Я OrionX Assistant. Напиши задачу — постараюсь помочь.")
+    text = (
+        "Привет! Я OrionX Assistant — практичный AI-ассистент.\n"
+        "Помогаю с задачами, автоматизацией и личной продуктивностью.\n"
+        "Напиши, что нужно сделать. /help — список команд."
+    )
+    await message.answer(text)
 
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    text = (
+        "/start — запуск\n"
+        "/help — подсказка\n"
+        "/clear_history — удалить твою историю (безопасно)\n"
+    )
+    if message.from_user.id == MY_ID:
+        text += "/admin — статистика (владелец)\n"
+    await message.answer(text)
+
+@dp.message(Command("clear_history"))
+async def cmd_clear_history(message: types.Message):
+    uid = str(message.from_user.id)
+    histories = load_history()
+    if uid in histories:
+        histories.pop(uid, None)
+        save_history(histories)
+        await message.answer("Ваша история очищена.")
+    else:
+        await message.answer("У вас нет сохранённой истории.")
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != MY_ID:
+        return
+    histories = load_history()
+    total_users = len(histories)
+    await message.answer(f"Статей пользователей в памяти: {total_users}\nМодель: {SELECTED_MODEL}")
+
+# ---------------------------
+# 8. Основной хендлер сообщений
+# ---------------------------
 @dp.message(F.text)
 async def handle_message(message: types.Message):
     uid = str(message.from_user.id)
 
-    # Показываем статус "печатает"
+    # show typing
     try:
         await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     except Exception:
-        # если не удалось отправить chat action — не критично
         pass
 
     try:
@@ -159,42 +217,43 @@ async def handle_message(message: types.Message):
         model = get_model(is_admin=(int(uid) == MY_ID))
         chat = model.start_chat(history=user_history)
 
-        # Выполняем блокирующий вызов в отдельном потоке
+        # heavy call in thread
         response = await asyncio.to_thread(chat.send_message, message.text)
 
-        # Сохраняем последние HISTORY_LIMIT элементов истории
+        # save last HISTORY_LIMIT turns
         new_history = []
         for content in getattr(chat, "history", [])[-HISTORY_LIMIT:]:
             parts_texts = []
             for p in getattr(content, "parts", []):
-                text = getattr(p, "text", None)
-                if text:
-                    parts_texts.append(text)
+                t = getattr(p, "text", None)
+                if t:
+                    parts_texts.append(t)
             new_history.append({"role": getattr(content, "role", None), "parts": parts_texts})
 
         histories[uid] = new_history
         save_history(histories)
 
-        # Отправляем ответ (без parse_mode чтобы не ломать спецсимволы)
-        await message.answer(response.text)
+        # send the response safely (split long messages)
+        await send_long_message(message.chat.id, response.text or "—")
 
     except Exception as e:
         logger.exception("Ошибка чата: %s", e)
-        await message.answer("⚠️ Ошибка. Проверь API-ключ Gemini и сетевое соединение.")
+        await message.answer("⚠️ Внутренняя ошибка при обращении к ИИ. Попробуйте позже.")
 
 # ---------------------------
-# 6. Запуск
+# 9. Запуск
 # ---------------------------
 async def main():
-    # Регистрируем команды (опционально)
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="Запуск бота"),
+            BotCommand(command="help", description="Помощь"),
+            BotCommand(command="clear_history", description="Очистить историю"),
         ])
     except Exception as e:
         logger.warning("Не удалось установить команды: %s", e)
 
-    logger.info("Запуск бота. Выбранная модель: %s", SELECTED_MODEL)
+    logger.info("Бот запущен. Модель: %s", SELECTED_MODEL)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
